@@ -81,20 +81,6 @@ Report Generation
 - LLL Fault
 - LLLG Fault
 
----
-
-## Project Images
-
-(Add your screenshots here.)
-
----
-
-## Demo
-
-(Add your YouTube video link.)
-
----
-
 ## Future Improvements
 
 - Machine Learning Fault Prediction
