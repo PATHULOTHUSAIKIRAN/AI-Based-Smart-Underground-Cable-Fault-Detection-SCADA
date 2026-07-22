@@ -1,0 +1,548 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <ArduinoJson.h>
+#include <map>
+
+// ================= 1. WIFI SETTINGS =================
+const char* ssid = "Sai";         
+const char* password = "saikiran"; 
+WebServer server(80);
+
+// ================= 2. PIN DEFINITIONS =================
+#define VR_PIN 35
+#define VY_PIN 32
+#define VB_PIN 33
+#define BATT_PIN 34
+#define RELAY_RG1 13
+#define RELAY_RY1 26
+#define RELAY_YG1 14
+#define RELAY_YB1 25
+#define RELAY_BG1 27
+#define RELAY_RB1 21
+#define RELAY_RG2 16
+#define RELAY_RY2 19
+#define RELAY_YG2 17
+#define RELAY_YB2 23
+#define RELAY_BG2 18
+#define RELAY_RB2 4
+
+// ================= 3. SYSTEM STATE VARIABLES =================
+float Vr = 5.0, Vy = 5.0, Vb = 5.0, Battery = 8.2;
+bool auto_detect = false;
+
+std::map<String, int> relayStates = {
+  {"RG1", 0}, {"RY1", 0}, {"YG1", 0}, {"YB1", 0}, {"BG1", 0}, {"RB1", 0},
+  {"RG2", 0}, {"RY2", 0}, {"YG2", 0}, {"YB2", 0}, {"BG2", 0}, {"RB2", 0}
+};
+
+float ai_health = 100.0;
+String ai_severity = "NORMAL";
+String ai_fault_type = "NONE";
+String ai_fault_phase = "N/A";
+float ai_risk = 0.0;
+String ai_maint = "ROUTINE";
+String ai_cause = "N/A";
+int ai_confidence = 100;
+String ai_recommendation = "System Operating Nominally";
+int ai_fault_distance = 0; 
+
+#define HISTORY_SIZE 60
+float hist_Vr[HISTORY_SIZE];
+float hist_Vy[HISTORY_SIZE];
+float hist_Vb[HISTORY_SIZE];
+unsigned long lastHistoryUpdate = 0;
+unsigned long lastWiFiCheck = 0;
+
+// ================= 4. HTML DASHBOARD (PROGMEM) =================
+const char index_html[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>M.Tech Industry 4.0 SCADA</title>
+    <style>
+        :root {
+            --bg-dark: #0a0a0a; --panel-bg: #111111; 
+            --text-main: #00ffcc; --text-muted: #888888;
+            --danger: #ff3333; --warning: #ffcc00; --border: #333333;
+            --r-color: #ff4444; --y-color: #ffcc00; --b-color: #33b5e5;
+        }
+        * { box-sizing: border-box; }
+        body { background-color: var(--bg-dark); color: var(--text-main); font-family: 'Courier New', Courier, monospace; margin: 0; padding: 10px; height: 100vh; display: flex; flex-direction: column; overflow: hidden; }
+        ::-webkit-scrollbar { width: 8px; height: 8px; }
+        ::-webkit-scrollbar-track { background: #000; border-left: 1px solid var(--border); }
+        ::-webkit-scrollbar-thumb { background: #333; border-radius: 4px; }
+        ::-webkit-scrollbar-thumb:hover { background: var(--text-main); }
+        
+        .header { display: flex; justify-content: space-between; align-items: center; background: var(--panel-bg); padding: 10px 20px; border: 1px solid var(--border); border-radius: 3px; margin-bottom: 10px; flex-shrink: 0; }
+        .header h1 { margin: 0; font-size: 20px; letter-spacing: 2px; color: var(--text-main); }
+        .clock { font-size: 20px; font-weight: bold; color: white; background: #000; padding: 5px 15px; border-radius: 3px; border: 1px solid var(--text-main);}
+        .top-sys-btn { background: #222; color: #fff; border: 1px solid var(--text-main); padding: 7px 15px; cursor: pointer; font-family: inherit; font-weight: bold; font-size: 14px; border-radius: 3px;}
+        .top-sys-btn:hover { background: var(--text-main); color: #000; }
+
+        .dashboard-grid { display: grid; grid-template-columns: 1fr 1fr; grid-template-rows: 1fr 1fr; gap: 10px; flex-grow: 1; height: calc(100vh - 80px); }
+        .panel { background: var(--panel-bg); border: 1px solid var(--border); border-radius: 3px; padding: 15px; display: flex; flex-direction: column; position: relative; overflow-y: auto; overflow-x: hidden; }
+        .panel h2 { margin: 0 0 10px 0; font-size: 14px; border-bottom: 1px solid var(--border); padding-bottom: 5px; color: white; flex-shrink: 0; display:flex; justify-content:space-between; align-items: center;}
+        
+        .canvas-container { flex-grow: 1; width: 100%; min-height: 120px; background: #000; border: 1px solid var(--border); border-radius: 3px; position: relative; margin-bottom:5px;}
+        canvas { width: 100%; height: 100%; display: block; }
+
+        .controls-wrapper { display: flex; gap: 15px; flex-grow: 1; margin-bottom: 10px;}
+        .btn-matrix { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; flex-grow: 1; }
+        button.action-btn { background: #000; border: 1px solid var(--border); color: white; font-family: inherit; font-size: 12px; cursor: pointer; border-radius: 3px; transition: all 0.2s ease; padding: 12px 0;}
+        button.action-btn:hover { border-color: var(--text-main); background: #111; }
+        button.action-btn.active-fault { background: var(--danger); color: white; border-color: darkred; box-shadow: inset 0 0 10px rgba(0, 0, 0, 0.5), 0 0 8px rgba(255, 0, 0, 0.6); font-weight: bold; }
+        
+        .status-box { width: 160px; background: #000; border: 1px solid var(--border); padding: 10px; display: flex; flex-direction: column; justify-content: space-around; flex-shrink: 0; border-radius: 3px;}
+        .health-score { font-size: 36px; font-weight: bold; text-align: center; margin: 5px 0; }
+        
+        .button-row { display: flex; gap: 10px; width: 100%; flex-shrink: 0;}
+        button.estop { background: darkred; color: white; border: 2px solid red; padding: 15px; font-size: 16px; font-weight: bold; cursor: pointer; flex: 1; border-radius: 3px; transition: 0.2s;}
+        button.estop:hover { background: red; box-shadow: 0 0 15px red; }
+        button.demo-btn { background: var(--warning); color: #000; border: 2px solid #a80; padding: 15px; font-size: 16px; font-weight: bold; cursor: pointer; flex: 1; border-radius: 3px; transition: 0.2s;}
+        button.demo-btn:hover { background: #ffd700; box-shadow: 0 0 15px var(--warning); }
+
+        .ai-box { display: flex; flex-wrap: wrap; gap: 8px; background: #000; border: 1px solid #333; padding: 10px; border-radius: 3px; margin-bottom: 10px; font-size: 11px; }
+        .ai-item { flex: 1 1 30%; }
+        
+        .cable-map { position: relative; background: #000; border: 1px solid #333; padding: 20px 10px; border-radius: 3px; text-align: center; color: var(--text-muted); font-size: 12px; margin-bottom: 10px;}
+        .map-line { position: absolute; top: 50%; left: 10%; right: 10%; height: 4px; background: #444; z-index: 1; }
+        .fault-pointer { display: none; position: absolute; top: 55%; transform: translateX(-50%); text-align: center; color: var(--danger); font-weight: bold; z-index: 3; transition: left 0.3s ease;}
+
+        .log-container { flex-grow: 1; background: #000; border: 1px solid var(--border); overflow-y: auto; font-size: 11px; border-radius: 3px;}
+        table { width: 100%; border-collapse: collapse; } th, td { padding: 6px 8px; text-align: left; border-bottom: 1px solid #222; } th { color: var(--text-muted); position: sticky; top: 0; background: #111; border-bottom: 2px solid var(--border); z-index: 2;}
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>SMART 3-PHASE UNDERGROUND CABLE HMI</h1>
+        <div>
+            <button class="top-sys-btn" onclick="downloadCSV()">CSV EXPORT</button>
+            <div class="clock" id="real-time-clock" style="display:inline-block; margin-left:10px;">00:00:00</div>
+        </div>
+    </div>
+
+    <div class="dashboard-grid">
+        <div class="panel">
+            <h2>
+                <span>LIVE V-T WAVEFORM (Time Domain)</span>
+                <span style="font-size:12px; color:var(--text-main); font-weight:normal;">BATTERY: <span id="batt-val">8.2</span>V</span>
+            </h2>
+            <div class="canvas-container" style="flex: 2;"><canvas id="waveCanvas"></canvas></div>
+            <div style="font-size:10px; color:#888; margin-bottom:2px; text-transform: uppercase;">60 Second Historical Trend</div>
+            <div class="canvas-container" style="flex: 1; margin-bottom: 0;"><canvas id="trendCanvas"></canvas></div>
+        </div>
+
+        <div class="panel">
+            <h2>LIVE V-I CHARACTERISTICS (Phasor Domain)</h2>
+            <div class="canvas-container" style="margin-bottom:0;"><canvas id="phasorCanvas"></canvas></div>
+        </div>
+
+        <div class="panel">
+            <h2>
+                <span>FAULT CONTROL PANEL</span>
+                <button class="top-sys-btn" id="auto-btn" onclick="toggleAuto()" style="font-size:10px; padding:3px 8px;">AUTO: OFF</button>
+            </h2>
+            <div class="controls-wrapper">
+                <div style="flex: 1; display: flex; flex-direction: column;">
+                    <div style="color:var(--text-muted); font-size:11px; margin-bottom:5px; text-align:center; letter-spacing: 1px;">1km Node Matrix</div>
+                    <div class="btn-matrix">
+                        <button class="action-btn" id="btn-RG1" onclick="sendCommand('RG1')">R-G</button>
+                        <button class="action-btn" id="btn-RY1" onclick="sendCommand('RY1')">R-Y</button>
+                        <button class="action-btn" id="btn-YG1" onclick="sendCommand('YG1')">Y-G</button>
+                        <button class="action-btn" id="btn-YB1" onclick="sendCommand('YB1')">Y-B</button>
+                        <button class="action-btn" id="btn-BG1" onclick="sendCommand('BG1')">B-G</button>
+                        <button class="action-btn" id="btn-RB1" onclick="sendCommand('RB1')">R-B</button>
+                    </div>
+                </div>
+
+                <div style="flex: 1; display: flex; flex-direction: column;">
+                    <div style="color:var(--text-muted); font-size:11px; margin-bottom:5px; text-align:center; letter-spacing: 1px;">2km Node Matrix</div>
+                    <div class="btn-matrix">
+                        <button class="action-btn" id="btn-RG2" onclick="sendCommand('RG2')">R-G</button>
+                        <button class="action-btn" id="btn-RY2" onclick="sendCommand('RY2')">R-Y</button>
+                        <button class="action-btn" id="btn-YG2" onclick="sendCommand('YG2')">Y-G</button>
+                        <button class="action-btn" id="btn-YB2" onclick="sendCommand('YB2')">Y-B</button>
+                        <button class="action-btn" id="btn-BG2" onclick="sendCommand('BG2')">B-G</button>
+                        <button class="action-btn" id="btn-RB2" onclick="sendCommand('RB2')">R-B</button>
+                    </div>
+                </div>
+
+                <div class="status-box">
+                    <div style="font-size: 11px; color: var(--text-muted); text-align:center;">SYSTEM HEALTH</div>
+                    <div class="health-score" id="health-readout" style="color: lime;">100%</div>
+                    <div id="stat-r" style="color: lime; font-size: 12px; margin-top:2px;">R Phase: <span id="val-vr" style="font-weight:bold;">5.0V</span></div>
+                    <div id="stat-y" style="color: lime; font-size: 12px; margin-top:2px;">Y Phase: <span id="val-vy" style="font-weight:bold;">5.0V</span></div>
+                    <div id="stat-b" style="color: lime; font-size: 12px; margin-top:2px;">B Phase: <span id="val-vb" style="font-weight:bold;">5.0V</span></div>
+                </div>
+            </div>
+            <div class="button-row">
+                <button class="estop" onclick="emergencyStop()">EMERGENCY TRIP (RESET)</button>
+                <button class="demo-btn" onclick="startCompetition()">COMPETITION DEMO</button>
+            </div>
+        </div>
+
+        <div class="panel">
+            <h2>NETWORK DIAGRAM & PREDICTIVE ANALYTICS</h2>
+            <div class="ai-box">
+                <div class="ai-item"><span style="color:var(--text-muted);">Fault:</span> <span id="ai-fault-type" style="color:lime; font-weight:bold;">NONE</span></div>
+                <div class="ai-item"><span style="color:var(--text-muted);">Active Relays:</span> <span id="ai-phases" style="color:white; font-weight:bold;">N/A</span></div>
+                <div class="ai-item"><span style="color:var(--text-muted);">Severity:</span> <span id="ai-sev" style="color:lime;">NORMAL</span></div>
+                
+                <div class="ai-item"><span style="color:var(--text-muted);">Failure Risk:</span> <span id="ai-risk" style="color:white;">0%</span></div>
+                <div class="ai-item"><span style="color:var(--text-muted);">Maint. Priority:</span> <span id="ai-maint" style="color:white;">ROUTINE</span></div>
+                <div class="ai-item"><span style="color:var(--text-muted);">Confidence:</span> <span id="ai-confidence" style="color:white;">100%</span></div>
+                
+                <div style="flex: 1 1 100%; border-top: 1px solid #222; padding-top: 5px; margin-top: 2px;">
+                    <span style="color:var(--text-muted);">Cause:</span> <span id="ai-cause" style="color:white;">N/A</span><br>
+                    <span style="color:var(--text-muted);">Action:</span> <span id="ai-recommendation" style="color:var(--warning);">System Operating Nominally</span>
+                </div>
+            </div>
+
+            <div class="cable-map">
+                <div style="display: flex; justify-content: space-between; position: relative; z-index: 2;">
+                    <span>0km (Bus)</span><span>1km</span><span>2km</span><span>3km (Load)</span>
+                </div>
+                <div class="map-line"></div>
+                <div class="fault-pointer" id="map-fault-pointer"><div style="font-size: 14px;">▲</div><div>FAULT</div></div>
+            </div>
+
+            <div class="log-container">
+                <table id="main-log"><thead><tr><th>Time</th><th>Event Type</th><th>Details</th></tr></thead><tbody id="log-table"></tbody></table>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        setInterval(() => { document.getElementById('real-time-clock').innerText = new Date().toLocaleTimeString('en-US', { hour12: true }); }, 1000);
+
+        function downloadCSV() {
+            let rows = document.querySelectorAll('#main-log tr');
+            let csvContent = "";
+            rows.forEach(row => {
+                let cols = row.querySelectorAll('td, th');
+                let rowData = [];
+                cols.forEach(col => rowData.push('"' + col.innerText + '"'));
+                csvContent += rowData.join(",") + "\n";
+            });
+            let blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+            let url = URL.createObjectURL(blob);
+            let link = document.createElement("a");
+            link.setAttribute("href", url);
+            link.setAttribute("download", "scada_hmi_dashboard_log.csv");
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
+        }
+
+        let sysData = { Vr: 5.0, Vy: 5.0, Vb: 5.0, Battery: 8.2, relays: {}, exact_relays: "N/A" };
+        let sysHistory = { Vr: [], Vy: [], Vb: [] };
+        let lastLoggedFault = null;
+
+        setInterval(() => {
+            fetch('/api/dashboard_data')
+                .then(res => res.json())
+                .then(data => { sysData = data.state; sysHistory = data.history; updateUI(); })
+                .catch(e => console.log("Waiting for backend..."));
+        }, 500);
+
+        function updateUI() {
+            document.getElementById('health-readout').innerText = sysData.health + '%';
+            document.getElementById('health-readout').style.color = sysData.health > 80 ? 'lime' : (sysData.health > 50 ? 'orange' : 'red');
+            document.getElementById('batt-val').innerText = (sysData.Battery || 8.2).toFixed(1);
+            
+            document.getElementById('val-vr').innerText = (sysData.Vr || 0).toFixed(1) + 'V';
+            document.getElementById('val-vy').innerText = (sysData.Vy || 0).toFixed(1) + 'V';
+            document.getElementById('val-vb').innerText = (sysData.Vb || 0).toFixed(1) + 'V';
+
+            document.getElementById('stat-r').style.color = (sysData.Vr < 4.5) ? 'red' : 'lime';
+            document.getElementById('stat-y').style.color = (sysData.Vy < 4.5) ? 'red' : 'lime';
+            document.getElementById('stat-b').style.color = (sysData.Vb < 4.5) ? 'red' : 'lime';
+
+            document.getElementById('auto-btn').innerText = sysData.auto_detect ? "AUTO: ON" : "AUTO: OFF";
+            document.getElementById('auto-btn').style.background = sysData.auto_detect ? "var(--text-main)" : "#222";
+            document.getElementById('auto-btn').style.color = sysData.auto_detect ? "#000" : "#fff";
+
+            ['RG1','YG1','BG1','RY1','YB1','RB1','RG2','YG2','BG2','RY2','YB2','RB2'].forEach(key => {
+                let btn = document.getElementById(`btn-${key}`);
+                if (btn && sysData.relays) {
+                    if (sysData.relays[key] == 1) btn.classList.add('active-fault');
+                    else btn.classList.remove('active-fault');
+                }
+            });
+
+            document.getElementById('ai-fault-type').innerText = sysData.active_fault || "NONE";
+            document.getElementById('ai-fault-type').style.color = (sysData.active_fault && sysData.active_fault !== "NONE") ? "red" : "lime";
+            
+            // Populates explicitly with RG1, RY1, etc.
+            document.getElementById('ai-phases').innerText = sysData.exact_relays || "N/A";
+            
+            document.getElementById('ai-risk').innerText = (sysData.failure_probability || 0) + '%';
+            document.getElementById('ai-risk').style.color = sysData.failure_probability > 50 ? "red" : "lime";
+            document.getElementById('ai-maint').innerText = sysData.maintenance_priority || "ROUTINE";
+            document.getElementById('ai-maint').style.color = sysData.maintenance_priority == "URGENT" ? "red" : "lime";
+            
+            document.getElementById('ai-cause').innerText = sysData.cause || "N/A";
+            document.getElementById('ai-sev').innerText = sysData.severity || "NORMAL";
+            document.getElementById('ai-sev').style.color = sysData.severity == "NORMAL" ? "lime" : "red";
+            document.getElementById('ai-confidence').innerText = (sysData.ai_confidence || 100) + '%';
+            document.getElementById('ai-recommendation').innerText = sysData.ai_recommendation || "System Operating Nominally";
+
+            // Corrected Mapping alignment to the exact text spacing (33.3% and 66.6%)
+            const pointer = document.getElementById('map-fault-pointer');
+            if (sysData.active_fault && sysData.active_fault !== "NONE") {
+                pointer.style.display = 'block';
+                pointer.style.left = sysData.fault_distance == 1 ? '33.3%' : '66.6%';
+            } else {
+                pointer.style.display = 'none';
+            }
+
+            if (sysData.active_fault && sysData.active_fault !== "NONE" && lastLoggedFault !== sysData.active_fault + sysData.fault_distance) {
+                logEvent("FAULT", `${sysData.active_fault} @ ${sysData.fault_distance}km`, "red");
+                lastLoggedFault = sysData.active_fault + sysData.fault_distance;
+            } else if ((!sysData.active_fault || sysData.active_fault === "NONE") && lastLoggedFault !== null) {
+                logEvent("CLEAR", "System nominal", "lime");
+                lastLoggedFault = null;
+            }
+        }
+
+        function sendCommand(id) {
+            let newState = sysData.relays[id] == 1 ? 0 : 1;
+            fetch('/api/trigger_relay', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({id: id, state: newState}) });
+        }
+        function toggleAuto() { fetch('/api/toggle_auto', { method: 'POST' }); }
+        function startCompetition() { fetch('/api/competition_demo', { method: 'POST' }); }
+        
+        function emergencyStop() {
+            ['RG1','YG1','BG1','RY1','YB1','RB1','RG2','YG2','BG2','RY2','YB2','RB2'].forEach(key => {
+                if (sysData.relays[key] == 1) fetch('/api/trigger_relay', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({id: key, state: 0}) });
+            });
+        }
+        function logEvent(type, details, color) { document.getElementById('log-table').insertAdjacentHTML('afterbegin', `<tr><td>${new Date().toLocaleTimeString()}</td><td style="color:${color}; font-weight:bold;">${type}</td><td>${details}</td></tr>`); }
+
+        const wCtx = document.getElementById('waveCanvas').getContext('2d');
+        const pCtx = document.getElementById('phasorCanvas').getContext('2d');
+        const tCtx = document.getElementById('trendCanvas').getContext('2d');
+        let timeTracker = 0;
+
+        function resizeCanvases() {
+            [wCtx, pCtx, tCtx].forEach(c => { c.canvas.width = c.canvas.parentElement.clientWidth; c.canvas.height = c.canvas.parentElement.clientHeight; });
+        }
+        window.addEventListener('resize', resizeCanvases); setTimeout(resizeCanvases, 100);
+
+        function drawSystem() {
+            timeTracker += 0.05; 
+            if (wCtx.canvas.width > 0) drawWaves(sysData.Vr || 5, sysData.Vy || 5, sysData.Vb || 5);
+            if (pCtx.canvas.width > 0) drawPhasors(sysData);
+            if (tCtx.canvas.width > 0) drawTrends();
+            requestAnimationFrame(drawSystem);
+        }
+
+        function drawWaves(vR, vY, vB) {
+            let w = wCtx.canvas.width, h = wCtx.canvas.height, midY = h / 2;
+            wCtx.clearRect(0, 0, w, h); wCtx.strokeStyle = '#333'; wCtx.beginPath(); wCtx.moveTo(0, midY); wCtx.lineTo(w, midY); wCtx.stroke();
+            drawSingleWave(wCtx, '#ff4444', vR, 0, timeTracker, w, midY); drawSingleWave(wCtx, '#ffcc00', vY, 2.094, timeTracker, w, midY); drawSingleWave(wCtx, '#33b5e5', vB, 4.188, timeTracker, w, midY);
+        }
+        function drawSingleWave(ctx, color, amp, phaseOffset, time, w, midY) {
+            ctx.strokeStyle = color; ctx.lineWidth = 2; ctx.beginPath();
+            for(let x=0; x<w; x++) { let y = midY - (amp * 10 * Math.sin((x * 0.05) - time + phaseOffset)); if(x===0) ctx.moveTo(x,y); else ctx.lineTo(x,y); }
+            ctx.stroke();
+        }
+
+        function drawTrends() {
+            let w = tCtx.canvas.width, h = tCtx.canvas.height;
+            tCtx.clearRect(0,0,w,h); tCtx.strokeStyle='#333'; tCtx.strokeRect(0,0,w,h);
+            if (sysHistory && sysHistory.Vr) {
+                dt(tCtx, sysHistory.Vr, '#ff4444', w, h); dt(tCtx, sysHistory.Vy, '#ffcc00', w, h); dt(tCtx, sysHistory.Vb, '#33b5e5', w, h);
+            }
+        }
+        function dt(ctx, arr, c, w, h) { 
+            if(!arr || !arr.length) return; 
+            ctx.strokeStyle=c; ctx.lineWidth=2; ctx.beginPath(); 
+            let step = w / 60;
+            for(let i=0; i<arr.length; i++) { let x = i * step; let y = h - (arr[i] / 6.0 * h); if(i==0) ctx.moveTo(x,y); else ctx.lineTo(x,y); }
+            ctx.stroke(); 
+        }
+
+        function drawPhasors(data) {
+            let w = pCtx.canvas.width, h = pCtx.canvas.height, cx = w / 2, cy = h / 2, maxRadius = Math.min(cx, cy) - 10;
+            pCtx.clearRect(0, 0, w, h); pCtx.strokeStyle = '#222'; pCtx.beginPath(); pCtx.arc(cx, cy, maxRadius, 0, 6.28); pCtx.stroke();
+            let aR = 0, aY = 2.094, aB = 4.188;
+            drawVector(pCtx, cx, cy, aR, (data.Vr||0) * (maxRadius/6), '#ff4444', 3); drawVector(pCtx, cx, cy, aY, (data.Vy||0) * (maxRadius/6), '#ffcc00', 3); drawVector(pCtx, cx, cy, aB, (data.Vb||0) * (maxRadius/6), '#33b5e5', 3);
+        }
+        function drawVector(ctx, cx, cy, angle, length, color, width) {
+            let ex = cx + length * Math.cos(angle), ey = cy + length * Math.sin(angle);
+            ctx.strokeStyle = color; ctx.lineWidth = width; ctx.beginPath(); ctx.moveTo(cx, cy); ctx.lineTo(ex, ey); ctx.stroke();
+            ctx.fillStyle = color; ctx.beginPath(); ctx.arc(ex, ey, width*1.5, 0, 6.28); ctx.fill();
+        }
+
+        drawSystem();
+    </script>
+</body>
+</html>
+)rawliteral";
+
+// ================= 5. HARDWARE LOGIC =================
+void updateRelayState(String id, int state) {
+  int pin = -1;
+  if (id == "RG1") pin = RELAY_RG1; else if (id == "RY1") pin = RELAY_RY1;
+  else if (id == "YG1") pin = RELAY_YG1; else if (id == "YB1") pin = RELAY_YB1;
+  else if (id == "BG1") pin = RELAY_BG1; else if (id == "RB1") pin = RELAY_RB1;
+  else if (id == "RG2") pin = RELAY_RG2; else if (id == "RY2") pin = RELAY_RY2;
+  else if (id == "YG2") pin = RELAY_YG2; else if (id == "YB2") pin = RELAY_YB2;
+  else if (id == "BG2") pin = RELAY_BG2; else if (id == "RB2") pin = RELAY_RB2;
+
+  if (pin != -1) {
+    relayStates[id] = state;
+    digitalWrite(pin, state == 1 ? HIGH : LOW);
+  }
+}
+
+// ================= 6. SETUP FUNCTION =================
+void setup() {
+  Serial.begin(115200);
+
+  for(int i = 0; i < HISTORY_SIZE; i++) { hist_Vr[i] = 5.0; hist_Vy[i] = 5.0; hist_Vb[i] = 5.0; }
+
+  pinMode(RELAY_RG1, OUTPUT); pinMode(RELAY_RY1, OUTPUT); pinMode(RELAY_YG1, OUTPUT); 
+  pinMode(RELAY_YB1, OUTPUT); pinMode(RELAY_BG1, OUTPUT); pinMode(RELAY_RB1, OUTPUT);
+  pinMode(RELAY_RG2, OUTPUT); pinMode(RELAY_RY2, OUTPUT); pinMode(RELAY_YG2, OUTPUT); 
+  pinMode(RELAY_YB2, OUTPUT); pinMode(RELAY_BG2, OUTPUT); pinMode(RELAY_RB2, OUTPUT);
+
+  pinMode(VR_PIN, INPUT); pinMode(VY_PIN, INPUT); pinMode(VB_PIN, INPUT); pinMode(BATT_PIN, INPUT);
+
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) { delay(500); Serial.print("."); }
+  Serial.println("\nWiFi Connected! IP: "); Serial.println(WiFi.localIP());
+
+  server.on("/", []() { server.send(200, "text/html", index_html); });
+
+  server.on("/api/data", []() {
+    StaticJsonDocument<256> doc;
+    doc["Vr"] = Vr; doc["Vy"] = Vy; doc["Vb"] = Vb;
+    doc["Mode"] = auto_detect ? "AUTO" : "MANUAL";
+    String response; serializeJson(doc, response);
+    server.send(200, "application/json", response);
+  });
+
+  // Fallback endpoint to prevent 404s if user accidentally navigates away
+  server.on("/api/download_csv", []() {
+      String csv = "Error: Please use the CSV Export button on the dashboard to generate the log.";
+      server.send(200, "text/plain", csv);
+  });
+
+  server.on("/api/ai_sync", HTTP_POST, []() {
+    if (server.hasArg("plain") == false) { server.send(400, "text/plain", "Body not received"); return; }
+    DynamicJsonDocument doc(1024);
+    deserializeJson(doc, server.arg("plain"));
+    
+    if (doc.containsKey("health")) ai_health = doc["health"].as<float>();
+    if (doc.containsKey("severity")) ai_severity = doc["severity"].as<String>();
+    if (doc.containsKey("fault_type")) ai_fault_type = doc["fault_type"].as<String>();
+    if (doc.containsKey("phase")) ai_fault_phase = doc["phase"].as<String>();
+    if (doc.containsKey("risk")) ai_risk = doc["risk"].as<float>();
+    if (doc.containsKey("maint")) ai_maint = doc["maint"].as<String>();
+    if (doc.containsKey("cause")) ai_cause = doc["cause"].as<String>();
+    if (doc.containsKey("recommendation")) ai_recommendation = doc["recommendation"].as<String>();
+    if (doc.containsKey("distance")) ai_fault_distance = doc["distance"].as<int>();
+    
+    // IMPORTANT: Simulated Python Overrides have been REMOVED here. 
+    // The ESP32 is reading physical voltages exclusively.
+
+    server.send(200, "text/plain", "OK");
+  });
+
+  server.on("/api/trigger_relay", HTTP_POST, []() {
+    if (server.hasArg("plain")) {
+      StaticJsonDocument<256> doc;
+      deserializeJson(doc, server.arg("plain"));
+      String id = doc["id"];
+      int state = doc["state"];
+      updateRelayState(id, state);
+      server.send(200, "text/plain", "OK");
+    } else { server.send(400); }
+  });
+
+  server.on("/api/toggle_auto", HTTP_POST, []() {
+    auto_detect = !auto_detect;
+    server.send(200, "text/plain", "OK");
+  });
+
+  server.on("/api/dashboard_data", []() {
+    DynamicJsonDocument doc(4096);
+    
+    JsonObject state = doc.createNestedObject("state");
+    state["Vr"] = Vr; state["Vy"] = Vy; state["Vb"] = Vb; state["Battery"] = Battery;
+    state["auto_detect"] = auto_detect;
+    state["health"] = ai_health;
+    state["severity"] = ai_severity;
+    state["active_fault"] = ai_fault_type;
+    state["fault_phase"] = ai_fault_phase;
+    state["failure_probability"] = ai_risk;
+    state["maintenance_priority"] = ai_maint;
+    state["cause"] = ai_cause;
+    state["ai_confidence"] = ai_confidence;
+    state["ai_recommendation"] = ai_recommendation;
+    state["fault_distance"] = ai_fault_distance;
+
+    // Constructs Explicit Name List (e.g. RG1, RY1)
+    String activeRelays = "";
+    for (auto const& x : relayStates) {
+        if(x.second == 1) {
+            if(activeRelays.length() > 0) activeRelays += ", ";
+            activeRelays += x.first;
+        }
+    }
+    if(activeRelays == "") activeRelays = "N/A";
+    state["exact_relays"] = activeRelays;
+
+    JsonObject relays = state.createNestedObject("relays");
+    for (auto const& x : relayStates) { relays[x.first] = x.second; }
+
+    JsonObject history = doc.createNestedObject("history");
+    JsonArray hVr = history.createNestedArray("Vr");
+    JsonArray hVy = history.createNestedArray("Vy");
+    JsonArray hVb = history.createNestedArray("Vb");
+    for(int i=0; i<HISTORY_SIZE; i++) {
+        hVr.add(hist_Vr[i]); hVy.add(hist_Vy[i]); hVb.add(hist_Vb[i]);
+    }
+
+    String response; serializeJson(doc, response);
+    server.send(200, "application/json", response);
+  });
+
+  server.begin();
+}
+
+// ================= 7. MAIN LOOP =================
+void loop() {
+  server.handleClient();
+  unsigned long currentMillis = millis();
+
+  if (WiFi.status() != WL_CONNECTED && (currentMillis - lastWiFiCheck >= 5000)) {
+    Serial.println("⚠️ Wi-Fi Dropped! Reconnecting...");
+    WiFi.disconnect(); WiFi.reconnect();
+    lastWiFiCheck = currentMillis;
+  }
+
+  // 🔥 IMPORTANT: Hardware Readings are turned BACK ON.
+  // The system relies on physical voltage sensors connected to pins 35, 32, and 33.
+  Vr = (analogRead(VR_PIN) / 4095.0) * 5.0; 
+  Vy = (analogRead(VY_PIN) / 4095.0) * 5.0;
+  Vb = (analogRead(VB_PIN) / 4095.0) * 5.0;
+  Battery = (analogRead(BATT_PIN) / 4095.0) * 12.0;
+
+  if (currentMillis - lastHistoryUpdate >= 1000) {
+    for(int i = 0; i < HISTORY_SIZE - 1; i++) {
+      hist_Vr[i] = hist_Vr[i+1];
+      hist_Vy[i] = hist_Vy[i+1];
+      hist_Vb[i] = hist_Vb[i+1];
+    }
+    hist_Vr[HISTORY_SIZE - 1] = Vr;
+    hist_Vy[HISTORY_SIZE - 1] = Vy;
+    hist_Vb[HISTORY_SIZE - 1] = Vb;
+
+    lastHistoryUpdate = currentMillis;
+  }
+}
