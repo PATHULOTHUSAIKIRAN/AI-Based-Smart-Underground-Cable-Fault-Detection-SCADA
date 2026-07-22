@@ -1,0 +1,241 @@
+import requests
+import pyttsx3
+import csv
+import time
+import threading
+import queue
+from datetime import datetime
+
+# ==========================================
+# ⚙️ CONFIGURATION
+# ==========================================
+ESP32_IP = "http://10.59.75.175" # Make sure this matches your ESP32
+CSV_FILE = "scada_fault_log.csv"
+POLL_RATE = 1.0  # seconds
+
+class SCADAAI_Engine:
+    def __init__(self):
+        self.last_fault = "NONE"
+        self.is_running = True
+        
+        # --- Thread-safe Speech Queue ---
+        self.speech_queue = queue.Queue()
+        self.tts_thread = threading.Thread(target=self._tts_worker, daemon=True)
+        self.tts_thread.start()
+        
+        self.init_csv()
+
+    def _tts_worker(self):
+        """Dedicated background thread to handle TTS sequentially without crashing"""
+        while True:
+            text = self.speech_queue.get()
+            if text is None: 
+                break 
+            
+            # Re-initialize engine per message to prevent Windows COM freezes
+            engine = pyttsx3.init()
+            engine.say(text)
+            engine.runAndWait()
+            self.speech_queue.task_done()
+            time.sleep(0.5) # Buffer to ensure audio engine fully clears
+
+    def speak(self, text):
+        """Puts the text into the queue instead of spawning a new thread directly"""
+        print(f"🔊 [VOICE ALERT] {text}")
+        self.speech_queue.put(text)
+
+    def init_csv(self):
+        with open(CSV_FILE, mode='a', newline='') as file:
+            writer = csv.writer(file)
+            if file.tell() == 0:
+                writer.writerow(["Timestamp", "Vr (Sim)", "Vy (Sim)", "Vb (Sim)", "Fault_Type", "Phase_Relays", "Health", "Severity", "Mode"])
+
+    def _evaluate_node_fault(self, rg, yg, bg, ry, yb, rb, distance):
+        """
+        Dynamically evaluates the relays for a single node to determine the fault tier.
+        Returns a fault dictionary if a fault exists, otherwise None.
+        """
+        phases = set()
+        grounded = False
+
+        if rg == 1: phases.add('R'); grounded = True
+        if yg == 1: phases.add('Y'); grounded = True
+        if bg == 1: phases.add('B'); grounded = True
+
+        if ry == 1: phases.update(['R', 'Y'])
+        if yb == 1: phases.update(['Y', 'B'])
+        if rb == 1: phases.update(['R', 'B'])
+
+        num_phases = len(phases)
+
+        if num_phases == 0:
+            return None
+
+        phase_str = ",".join(sorted(list(phases)))
+        phase_label = "-".join(sorted(list(phases)))
+
+        if num_phases == 3 and grounded:
+            f_type = f"{phase_label}-G (LLLG)"
+            sev = "CATASTROPHIC"
+            health = 0
+            pct = 0.10
+            rec = "Emergency shutdown and dispatch repair crew."
+            
+        elif num_phases == 3 and not grounded:
+            f_type = f"{phase_label} (LLL)"
+            sev = "CRITICAL"
+            health = 25
+            pct = 0.20
+            rec = "Isolate feeder immediately."
+            
+        elif num_phases == 2 and grounded:
+            f_type = f"{phase_label}-G (LLG)"
+            sev = "HIGH"
+            health = 50
+            pct = 0.25
+            rec = "Inspect cable joint and grounding."
+            
+        elif num_phases == 2 and not grounded:
+            f_type = f"{phase_label} (LL)"
+            sev = "MEDIUM-HIGH"
+            health = 70
+            pct = 0.35
+            rec = "Check phase-to-phase insulation."
+            
+        elif num_phases == 1 and grounded:
+            f_type = f"{phase_label}-G (LG)"
+            sev = "MEDIUM"
+            health = 85
+            pct = 0.30
+            rec = f"Inspect insulation at affected phase ({phase_str})."
+            
+        else:
+            return None 
+
+        return {
+            "fault_type": f_type,
+            "distance": distance,
+            "severity": sev,
+            "health": health,
+            "vr_pct": pct if 'R' in phases else 1.0,
+            "vy_pct": pct if 'Y' in phases else 1.0,
+            "vb_pct": pct if 'B' in phases else 1.0,
+            "recommendation": rec
+        }
+
+    def classify_fault_state(self, relay_matrix):
+        """
+        Evaluates all nodes and returns the final SCADA dashboard state.
+        """
+        # Determine exact relays active for the UI display (e.g. "RG1, RY2")
+        active_relays = [k for k, v in relay_matrix.items() if v == 1]
+        exact_phase_string = ", ".join(active_relays) if active_relays else "N/A"
+
+        nominal_state = {
+            "fault_type": "NONE",
+            "phase": exact_phase_string,
+            "distance": 0,
+            "severity": "NORMAL",
+            "health": 100,
+            "vr_pct": 1.0, 
+            "vy_pct": 1.0,
+            "vb_pct": 1.0,
+            "recommendation": "System Operating Nominally."
+        }
+
+        fault_1 = self._evaluate_node_fault(
+            relay_matrix.get("RG1", 0), relay_matrix.get("YG1", 0), relay_matrix.get("BG1", 0),
+            relay_matrix.get("RY1", 0), relay_matrix.get("YB1", 0), relay_matrix.get("RB1", 0),
+            distance=1
+        )
+
+        fault_2 = self._evaluate_node_fault(
+            relay_matrix.get("RG2", 0), relay_matrix.get("YG2", 0), relay_matrix.get("BG2", 0),
+            relay_matrix.get("RY2", 0), relay_matrix.get("YB2", 0), relay_matrix.get("RB2", 0),
+            distance=2
+        )
+
+        final_fault = None
+        if fault_1 and fault_2:
+            final_fault = fault_1 if fault_1["health"] <= fault_2["health"] else fault_2
+        elif fault_1:
+            final_fault = fault_1
+        elif fault_2:
+            final_fault = fault_2
+
+        if final_fault:
+            final_fault["phase"] = exact_phase_string # Inject the exact relay names
+            return final_fault
+        else:
+            return nominal_state
+
+    def push_ai_state_to_esp32(self, ai_data):
+        try:
+            requests.post(f"{ESP32_IP}/api/ai_sync", json=ai_data, timeout=2)
+        except requests.exceptions.RequestException:
+            pass 
+
+    def auto_relay_protection(self, ai_data):
+        # Prevent splitting "N/A"
+        if ai_data['phase'] == "N/A": 
+            return
+            
+        print(f"🛡️ [PROTECTION] Automatically isolating fault at {ai_data['distance']}km")
+        dist = ai_data['distance']
+        
+        # If R, Y, or B are involved in the fault name, trip their ground relays
+        for p in ['R', 'Y', 'B']:
+            if p in ai_data['fault_type']:
+                relay_id = f"{p}G{dist}" 
+                try:
+                    requests.post(f"{ESP32_IP}/api/trigger_relay", json={"id": relay_id, "state": 1}, timeout=2)
+                except requests.exceptions.RequestException:
+                    pass
+
+    def run(self):
+        print("🚀 Starting Deterministic SCADA AI Edge Node...")
+        print(f"🔗 Target ESP32: {ESP32_IP}")
+        
+        while self.is_running:
+            try:
+                response = requests.get(f"{ESP32_IP}/api/dashboard_data", timeout=3)
+                
+                if response.status_code == 200:
+                    data = response.json()
+                    sys_state = data.get("state", {})
+                    relay_matrix = sys_state.get("relays", {})
+                    mode = "AUTO" if sys_state.get("auto_detect") else "MANUAL"
+
+                    ai_data = self.classify_fault_state(relay_matrix)
+                    current_fault = ai_data["fault_type"]
+
+                    if current_fault != "NONE" and current_fault != self.last_fault:
+                        self.speak(f"Warning! {current_fault} fault detected via relays {ai_data['phase']} at {ai_data['distance']} kilometers. Severity level: {ai_data['severity']}.")
+                    elif current_fault == "NONE" and self.last_fault != "NONE":
+                        self.speak("System restored to normal.")
+                    
+                    # Push state back to ESP32
+                    self.push_ai_state_to_esp32(ai_data)
+                    
+                    # 🔥 Grab the REAL hardware voltages from the ESP32 for the CSV Log
+                    real_vr = sys_state.get("Vr", 0.0)
+                    real_vy = sys_state.get("Vy", 0.0)
+                    real_vb = sys_state.get("Vb", 0.0)
+
+                    with open(CSV_FILE, mode='a', newline='') as file:
+                        csv.writer(file).writerow([datetime.now().strftime("%Y-%m-%d %H:%M:%S"), real_vr, real_vy, real_vb, current_fault, ai_data['phase'], ai_data["health"], ai_data["severity"], mode])
+                    
+                    print(f"[{datetime.now().strftime('%H:%M:%S')}] R:{real_vr:.1f}V Y:{real_vy:.1f}V B:{real_vb:.1f}V | H:{ai_data['health']}% S:{ai_data['severity']} Relays:[{ai_data['phase']}]")
+
+            except requests.exceptions.RequestException:
+                print("⚠️ [ERROR] Cannot reach ESP32. Check Wi-Fi connection. Retrying...")
+            
+            time.sleep(POLL_RATE)
+
+if __name__ == "__main__":
+    ai_node = SCADAAI_Engine()
+    try:
+        ai_node.run()
+    except KeyboardInterrupt:
+        print("\n🛑 Shutting down AI Node.")
+        ai_node.speech_queue.put(None)
